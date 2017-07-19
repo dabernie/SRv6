@@ -69,6 +69,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         ig_bd = 0
         eg_bd = 1
         nexthop = 1
+        tunnel_index = 2
         vrf = 1
         rmac = '00:33:33:33:33:33'
         smac = '00:33:33:33:33:33'
@@ -89,6 +90,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
 
         # nexthop
         self.add_nexthop(nexthop, eg_bd, dmac)
+        self.add_nexthop(tunnel_index, eg_bd, dmac)
 
         # MAC
         self.add_mac_entry(eg_bd, dmac, eg_ifindex)
@@ -107,12 +109,12 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         match_spec = srv6_l2_rewrite_match_spec_t(l2_metadata_bd=eg_bd)
         action_spec = srv6_smac_rewrite_action_spec_t(
             action_smac=macAddr_to_string(smac))
-        self.client.l2_rewrite_table_add_with_smac_rewrite(
+        status = self.client.l2_rewrite_table_add_with_smac_rewrite(
             self.sess_hdl, self.dev_tgt, match_spec, action_spec)
-
         self.conn_mgr.complete_operations(self.sess_hdl)
 
     def add_default_entries(self):
+        print 'Adding default entries ...'
         # L3 rewrite
         match_spec = srv6_l3_rewrite_match_spec_t(
             ipv6_valid=0x0, ipv4_valid=0x1)
@@ -188,12 +190,35 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         self.client.srv6_decap_table_add_with_pop_ipv6_srh(
             self.sess_hdl, self.dev_tgt, match_spec, 0)
 
+        # SRv6 encapsulation -- inner
+        match_spec = srv6_srv6_encap_inner_match_spec_t(
+            sr_metadata_action_=SRV6_SRH_INSERT,
+            ipv6_srh_valid=1,
+            ipv4_valid=0,
+            ipv6_valid=1)
+        self.client.srv6_encap_inner_table_add_with_inner_srh_rewrite(
+            self.sess_hdl, self.dev_tgt, match_spec) 
+
+        match_spec = srv6_srv6_encap_inner_match_spec_t(
+            sr_metadata_action_=SRV6_TUNNEL_ENCAP,
+            ipv6_srh_valid=1,
+            ipv4_valid=0,
+            ipv6_valid=1)
+        self.client.srv6_encap_inner_table_add_with_inner_ipv6_srh_rewrite(
+            self.sess_hdl, self.dev_tgt, match_spec) 
+        # TODO add more entries for other cases
+
+
+        print "Done."
+
+
     def create_vlan(self, vlan, vrf):
         action_spec = srv6_set_bd_properties_action_spec_t(
             action_bd=vlan, action_vrf=vrf)
         self.bd_handles[vlan] = \
             self.client.bd_action_profile_add_member_with_set_bd_properties(
                 self.sess_hdl, self.dev_tgt, action_spec)
+
 
     def add_interface(self, port, vlan, ifindex):
         match_spec = srv6_ingress_port_mapping_match_spec_t(
@@ -224,7 +249,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         self.client.nexthop_add_entry(
             self.sess_hdl, self.dev_tgt, match_spec, mbr)
 
-    def delete_nexthop(self, nexthop):
+    def delete_nexthop_all(self):
         #TODO
         pass
 
@@ -309,7 +334,13 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
                 self.client.ipv6_fib_lpm_table_delete_by_match_spec(
                     self.sess_hdl, self.dev_tgt, match_spec)
 
-    def add_local_sid(self, segment, psp=False, nexthop=None, ifindex=None, vrf=None, sid=None):
+    def add_local_sid(self,
+                      segment,
+                      psp=False,
+                      nexthop=None,
+                      ifindex=None,
+                      vrf=None,
+                      seg_list=None):
         if segment.func == 'END':
             match_spec = srv6_srv6_local_sid_match_spec_t(
                 ipv6_dstAddr=parse_ipv6(segment.sid),
@@ -506,20 +537,9 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
             self.client.srv6_local_sid_table_add_with_drop_(
                 self.sess_hdl, self.dev_tgt, match_spec, 1)
 
-        elif segment.func == 'END.B6.ENCAPS':
-            action_spec = srv6_end_dx4_action_spec_t(action_nexthop=nexthop)
-            match_spec = srv6_srv6_local_sid_match_spec_t(
-                ipv6_dstAddr=parse_ipv6(segment.sid),
-                ipv6_dstAddr_prefix_length=segment.prefix_len,
-                ipv6_srh_valid=1,
-                ipv6_srh_valid_mask=1,
-                ipv6_srh_segLeft=0,
-                ipv6_srh_segLeft_mask=-1,
-                ipv6_srh_nextHdr=0,
-                ipv6_srh_nextHdr_mask=0)
-            self.client.srv6_local_sid_table_add_with_end_b6_encaps(
-                self.sess_hdl, self.dev_tgt, match_spec, 0, action_spec)
-
+        elif segment.func == 'END.B6':
+            sid = parse_ipv6(seg_list[-1])
+            action_spec = srv6_end_b6_action_spec_t(action_sid=sid)
             match_spec = srv6_srv6_local_sid_match_spec_t(
                 ipv6_dstAddr=parse_ipv6(segment.sid),
                 ipv6_dstAddr_prefix_length=segment.prefix_len,
@@ -529,8 +549,47 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
                 ipv6_srh_segLeft_mask=0,
                 ipv6_srh_nextHdr=0,
                 ipv6_srh_nextHdr_mask=0)
+            self.client.srv6_local_sid_table_add_with_end_b6(
+                self.sess_hdl, self.dev_tgt, match_spec, 1, action_spec)
+
+            match_spec = srv6_srv6_local_sid_match_spec_t(
+                ipv6_dstAddr=parse_ipv6(segment.sid),
+                ipv6_dstAddr_prefix_length=segment.prefix_len,
+                ipv6_srh_valid=1,
+                ipv6_srh_valid_mask=1,
+                ipv6_srh_segLeft=0,
+                ipv6_srh_segLeft_mask=-1,
+                ipv6_srh_nextHdr=0,
+                ipv6_srh_nextHdr_mask=0)
             self.client.srv6_local_sid_table_add_with_drop_(
-                self.sess_hdl, self.dev_tgt, match_spec, 1)
+                self.sess_hdl, self.dev_tgt, match_spec, 0)
+
+        elif segment.func == 'END.B6.ENCAPS':
+            sid = parse_ipv6(seg_list[-1])
+            action_spec = srv6_end_b6_encaps_action_spec_t(action_sid=sid)
+            match_spec = srv6_srv6_local_sid_match_spec_t(
+                ipv6_dstAddr=parse_ipv6(segment.sid),
+                ipv6_dstAddr_prefix_length=segment.prefix_len,
+                ipv6_srh_valid=1,
+                ipv6_srh_valid_mask=1,
+                ipv6_srh_segLeft=0,
+                ipv6_srh_segLeft_mask=0,
+                ipv6_srh_nextHdr=0,
+                ipv6_srh_nextHdr_mask=0)
+            self.client.srv6_local_sid_table_add_with_end_b6_encaps(
+                self.sess_hdl, self.dev_tgt, match_spec, 1, action_spec)
+
+            match_spec = srv6_srv6_local_sid_match_spec_t(
+                ipv6_dstAddr=parse_ipv6(segment.sid),
+                ipv6_dstAddr_prefix_length=segment.prefix_len,
+                ipv6_srh_valid=1,
+                ipv6_srh_valid_mask=1,
+                ipv6_srh_segLeft=0,
+                ipv6_srh_segLeft_mask=-1,
+                ipv6_srh_nextHdr=0,
+                ipv6_srh_nextHdr_mask=0)
+            self.client.srv6_local_sid_table_add_with_drop_(
+                self.sess_hdl, self.dev_tgt, match_spec, 0)
 
 
     def delete_local_sid_all(self):
@@ -541,12 +600,141 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
             return
 
         while entry != -1:
-            self.client.srv6_local_sid_table_delete(self.sess_hdl, device, entry)
+            self.client.srv6_local_sid_table_delete(
+                self.sess_hdl, device, entry)
             try:
                 entry = self.client.srv6_local_sid_get_next_entry_handles(
                 self.sess_hdl, device, entry, 1)[0]
             except InvalidTableOperation as e:
                 entry = -1
+
+    def add_tunnel_rewrite_entry(self, tunnel_index, smac, dmac, sip, dip):
+        action_spec = srv6_set_tunnel_rewrite_action_spec_t(
+            action_smac = macAddr_to_string(smac),
+            action_dmac = macAddr_to_string(dmac),
+            action_sip = parse_ipv6(sip),
+            action_dip = parse_ipv6(dip))
+        match_spec = srv6_srv6_rewrite_match_spec_t(
+            l3_metadata_nexthop=tunnel_index)
+
+        self.client.srv6_rewrite_table_add_with_set_tunnel_rewrite(
+           self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+    def delete_tunnel_rewrite_entry(self, tunnel_index):
+        match_spec = srv6_srv6_rewrite_match_spec_t(
+            l3_metadata_nexthop=tunnel_index)
+        #FIXME
+        # self.client.srv6_rewrite_table_delete_by_match_spec(
+        #    self.sess_hdl, self.dev_tgt, match_spec)
+
+    def add_tunnel_entry(self, tunnel_index, seg_list):
+        # SRv6 encapsulation -- outer
+        n = len(seg_list)
+        # Insert outer IPv6 + SRH
+        match_spec = srv6_srv6_encap_outer_match_spec_t(
+            sr_metadata_action_=SRV6_TUNNEL_ENCAP,
+            l3_metadata_nexthop=tunnel_index)
+        if n == 1:
+            action_spec = srv6_ip_srv6_rewrite_1_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_ip_srv6_rewrite_1(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+        elif n == 2:
+            action_spec = srv6_ip_srv6_rewrite_2_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_sid1 = parse_ipv6(seg_list[1]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_ip_srv6_rewrite_2(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+        elif n == 3:
+            action_spec = srv6_ip_srv6_rewrite_3_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_sid1 = parse_ipv6(seg_list[1]),
+                action_sid2 = parse_ipv6(seg_list[2]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_ip_srv6_rewrite_3(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+        elif n == 4:
+            action_spec = srv6_ip_srv6_rewrite_4_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_sid1 = parse_ipv6(seg_list[1]),
+                action_sid2 = parse_ipv6(seg_list[2]),
+                action_sid3 = parse_ipv6(seg_list[3]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_ip_srv6_rewrite_4(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+       
+        # Insert a new SRH
+        match_spec = srv6_srv6_encap_outer_match_spec_t(
+            sr_metadata_action_=SRV6_SRH_INSERT,
+            l3_metadata_nexthop=tunnel_index)
+        if n == 1:
+            action_spec = srv6_srv6_rewrite_1_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_srv6_rewrite_1(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+        elif n == 2:
+            action_spec = srv6_srv6_rewrite_2_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_sid1 = parse_ipv6(seg_list[1]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_srv6_rewrite_2(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+        elif n == 3:
+            action_spec = srv6_srv6_rewrite_3_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_sid1 = parse_ipv6(seg_list[1]),
+                action_sid2 = parse_ipv6(seg_list[2]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_srv6_rewrite_3(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+
+        elif n == 4:
+            action_spec = srv6_srv6_rewrite_4_action_spec_t(
+                action_sid0 = parse_ipv6(seg_list[0]),
+                action_sid1 = parse_ipv6(seg_list[1]),
+                action_sid2 = parse_ipv6(seg_list[2]),
+                action_sid3 = parse_ipv6(seg_list[3]),
+                action_len = 2 * n,
+                action_seg_left = n - 1,
+                action_first_seg = n - 1)
+            self.client.srv6_encap_outer_table_add_with_srv6_rewrite_4(
+                self.sess_hdl, self.dev_tgt, match_spec, action_spec)
+ 
+    def delete_tunnel_entry(self, tunnel_index):
+        match_spec = srv6_srv6_encap_outer_match_spec_t(
+            sr_metadata_action_=SRV6_TUNNEL_ENCAP,
+            l3_metadata_nexthop=tunnel_index)
+        self.client.srv6_encap_outer_table_delete_by_match_spec(
+            self.sess_hdl, self.dev_tgt, match_spec)  
+
+        match_spec = srv6_srv6_encap_outer_match_spec_t(
+            sr_metadata_action_=SRV6_SRH_INSERT,
+            l3_metadata_nexthop=tunnel_index)
+        self.client.srv6_encap_outer_table_delete_by_match_spec(
+            self.sess_hdl, self.dev_tgt, match_spec)  
+
 
     """ Basic test """
     def runTest(self):
@@ -573,19 +761,26 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
             self.run_test_end_dx2()
 
             print '--------------- END.DX4 ---------------'
-            # XXX(Failing) self.run_test_end_dx4()
+            self.run_test_end_dx4()
 
             print '--------------- END.DX6 ---------------'
             self.run_test_end_dx6()
 
             print '--------------- END.DT4 ---------------'
-            # XXX(Failing) self.run_test_end_dt4()
+            self.run_test_end_dt4()
 
             print '--------------- END.DT6 ---------------'
             self.run_test_end_dt6()
 
+            print '---------------- END.B6 ---------------'
+            self.run_test_end_b6()
+
+            print '------------ END.B6.ENCAPS ------------'
+            self.run_test_end_b6_encaps()
+
             print '--------------- TRANSIT ---------------'
-            self.run_test_t()
+            #self.run_test_t()
+
 
         finally:
             pass
@@ -598,7 +793,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         nexthop = 1
 
         for segLeft in range(1, n):
-            print '\t local sid: %s, sl: %d, fs: %d' % (seg_list[segLeft], segLeft, n-1)
+            print '\t local sid: %s, SL: %d, FS: %d' % (seg_list[segLeft], segLeft, n-1)
             self.add_local_sid(self.segment(seg_list[segLeft], 128, 'END'))
             self.add_fib_entry(
                 vrf,
@@ -651,7 +846,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
             nexthop)
 
         for n in range(2, len(seg_list)):
-            print '\t local sid: %s, sl: %d, fs: %d' % (seg_list[segLeft], segLeft, n-1)
+            print '\t local sid: %s, SL: %d, FS: %d' % (seg_list[segLeft], segLeft, n-1)
             self.add_local_sid(
                 self.segment(seg_list[segLeft], 128, 'END'), psp=True)
 
@@ -694,7 +889,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         nexthop = 1
 
         for segLeft in range(1, n):
-            print '\t local sid: %s, sl: %d, fs: %d' % (seg_list[segLeft], segLeft, n-1)
+            print '\t local sid: %s, LS: %d, FS: %d' % (seg_list[segLeft], segLeft, n-1)
             self.add_local_sid(
                 self.segment(seg_list[segLeft], 128, 'END.X'), nexthop=nexthop)
 
@@ -728,7 +923,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         eg_ifindex = 2
 
         segLeft = 0
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(self.segment(seg_list[segLeft], 128, 'END.DX2'),
                            ifindex=eg_ifindex)
 
@@ -766,7 +961,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         n = len(seg_list) # Number of segments
         nexthop = 1
         segLeft = 0
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(self.segment(seg_list[segLeft], 128, 'END.DX6'),
                            nexthop=nexthop)
 
@@ -803,7 +998,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         segLeft = 0
         vrf = 1
         nexthop = 1
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(
             self.segment(seg_list[segLeft], 128, 'END.DT6'), vrf=vrf)
         self.add_fib_entry(
@@ -845,7 +1040,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         n = len(seg_list) # Number of segments
         nexthop = 1
         segLeft = 0
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(self.segment(seg_list[segLeft], 128, 'END.DX4'),
                            nexthop=nexthop)
 
@@ -881,7 +1076,7 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         nexthop = 1
         vrf = 1
         segLeft = 0
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(self.segment(seg_list[segLeft], 128, 'END.DT4'),
                            vrf=vrf)
         self.add_fib_entry(
@@ -921,17 +1116,28 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
 
     def run_test_end_b6_encaps(self):
         seg_list = ['2000::6', '2000::5', '2000::4', '2000::3', '2000::2']
-        new_seg_list = ['3000::3', '3000::2', '3000::1']
+        new_seg_list = ['3000::4', '3000::3', '3000::2']
         n = len(seg_list) # Number of segments
+        tunnel_index = 2
+        vrf = 1
         segLeft = 3
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        src_addr = '3000::1'
+        dst_addr = new_seg_list[-1]
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(
-            self.segment(seg_list[segLeft], 128, 'END.B6.ENCAPS'), sid)
+            self.segment(seg_list[segLeft], 128, 'END.B6.ENCAPS'),
+            seg_list=new_seg_list)
         self.add_fib_entry(
             vrf,
-            self.ipAddr('3000::!', 'Ipv6', 128),
-            nexthop)
-
+            self.ipAddr('3000::2', 'Ipv6', 128),
+            tunnel_index)
+        self.add_tunnel_entry(tunnel_index, new_seg_list)
+        self.add_tunnel_rewrite_entry(tunnel_index,
+                                      '00:55:55:55:55:55',
+                                      '00:44:44:44:44:44',
+                                      src_addr,
+                                      dst_addr)
+        udp_hdr = UDP(sport=1234, dport=80, chksum=0)
         pkt = simple_ipv6_sr_packet(eth_dst='00:33:33:33:33:33',
                                     eth_src='00:22:22:22:22:22',
                                     ipv6_dst=seg_list[segLeft],
@@ -939,25 +1145,40 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
                                     ipv6_hlim=64,
                                     srh_seg_left=segLeft,
                                     srh_first_seg=n-1,
-                                    srh_nh=IP_PROTOCOLS_IPV6,
-                                    srh_seg_list=seg_list)
-        n = len(new_seg_list) # Number of segments
-        pkt = simple_ipv6_sr_packet(eth_src='00:33:33:33:33:33',
-                                    eth_dst='00:44:44:44:44:44',
-                                    ipv6_dst=seg_list[segLeft],
+                                    srh_nh=IP_PROTOCOLS_UDP,
+                                    srh_seg_list=seg_list,
+                                    inner_frame=udp_hdr)
+        inner_pkt = simple_ipv6_sr_packet(eth_dst='00:33:33:33:33:33',
+                                    eth_src='00:22:22:22:22:22',
+                                    ipv6_dst=seg_list[segLeft - 1],
                                     ipv6_src='2000::1',
                                     ipv6_hlim=63,
+                                    srh_seg_left=segLeft - 1,
+                                    srh_first_seg=n-1,
+                                    srh_nh=IP_PROTOCOLS_UDP,
+                                    srh_seg_list=seg_list,
+                                    inner_frame=udp_hdr)
+        n = len(new_seg_list) # Number of segments
+        exp_pkt = simple_ipv6_sr_packet(eth_src='00:55:55:55:55:55',
+                                    eth_dst='00:44:44:44:44:44',
+                                    ipv6_dst=dst_addr,
+                                    ipv6_src=src_addr,
+                                    ipv6_hlim=64,
                                     srh_seg_left=n-1,
                                     srh_first_seg=n-1,
-                                    srh_nh=IP_PROTOCOLS_SR,
-                                    srh_seg_list=new_seg_list)
+                                    srh_nh=IP_PROTOCOLS_IPV6,
+                                    srh_seg_list=new_seg_list,
+                                    inner_frame=inner_pkt['IPv6'])
 
         send_packet(self, ig_port, str(pkt))
         verify_packets(self, exp_pkt, [eg_port])
 
+        self.delete_tunnel_entry(tunnel_index)
+        self.delete_tunnel_rewrite_entry(tunnel_index)
+
         self.delete_fib_entry(
             vrf,
-            self.ipAddr('2ffe::4', 'Ipv6', 128))
+            self.ipAddr('3000::2', 'Ipv6', 128))
         self.delete_local_sid_all()
 
         return
@@ -968,14 +1189,21 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
         new_seg_list = ['3000::3', '3000::2', '3000::1']
         n = len(seg_list) # Number of segments
         segLeft = 3
-        print '\t local sid: %s, sl: %d' % (seg_list[segLeft], segLeft)
+        vrf = 1
+        tunnel_index = 2
+
+        print '\t local sid: %s, SL: %d' % (seg_list[segLeft], segLeft)
         self.add_local_sid(
-            self.segment(seg_list[segLeft], 128, 'END.B6'), sid)
+            self.segment(seg_list[segLeft], 128, 'END.B6'),
+            seg_list=new_seg_list,
+            nexthop=tunnel_index)
         self.add_fib_entry(
             vrf,
-            self.ipAddr('3000::!', 'Ipv6', 128),
-            nexthop)
+            self.ipAddr('3000::1', 'Ipv6', 128),
+            tunnel_index)
+        self.add_tunnel_entry(tunnel_index, new_seg_list)
 
+        udp_hdr = UDP(sport=1234, dport=80, chksum=0)
         pkt = simple_ipv6_sr_packet(eth_dst='00:33:33:33:33:33',
                                     eth_src='00:22:22:22:22:22',
                                     ipv6_dst=seg_list[segLeft],
@@ -983,26 +1211,36 @@ class SRv6Test(pd_base_tests.ThriftInterfaceDataPlane):
                                     ipv6_hlim=64,
                                     srh_seg_left=segLeft,
                                     srh_first_seg=n-1,
-                                    srh_nh=IP_PROTOCOLS_IPV6,
-                                    srh_seg_list=seg_list)
+                                    srh_nh=IP_PROTOCOLS_UDP,
+                                    srh_seg_list=seg_list,
+                                    inner_frame=udp_hdr)
+
+        reserved = (n - 1) << 24
+        inner_frame = IPv6ExtHdrRouting(nh=IP_PROTOCOLS_UDP,
+                                        type=4,
+                                        segleft=segLeft,
+                                        reserved=reserved,
+                                        addresses=seg_list) / udp_hdr
         n = len(new_seg_list) # Number of segments
         exp_pkt = simple_ipv6_sr_packet(eth_src='00:33:33:33:33:33',
                                         eth_dst='00:44:44:44:44:44',
-                                        ipv6_dst=seg_list[segLeft],
+                                        ipv6_dst=new_seg_list[n-1],
                                         ipv6_src='2000::1',
                                         ipv6_hlim=63,
                                         srh_seg_left=n-1,
                                         srh_first_seg=n-1,
                                         srh_nh=IP_PROTOCOLS_SR,
                                         srh_seg_list=new_seg_list,
-                                        inner_frame=pkt)
+                                        inner_frame=inner_frame)
 
         send_packet(self, ig_port, str(pkt))
-        verify_packets(self, exp_pkt, [eg_port])
+        verify_any_packet_any_port(self, [exp_pkt], [eg_port])
 
+        self.delete_tunnel_entry(tunnel_index)
+        self.delete_tunnel_rewrite_entry(tunnel_index)
         self.delete_fib_entry(
             vrf,
-            self.ipAddr('2ffe::4', 'Ipv6', 128))
+            self.ipAddr('3000::1', 'Ipv6', 128))
         self.delete_local_sid_all()
 
         return

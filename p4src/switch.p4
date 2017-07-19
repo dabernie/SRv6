@@ -68,6 +68,7 @@
 //------------------------------------------------------------------------------
 // Table sizes
 //------------------------------------------------------------------------------
+
 #define ECMP_SELECT_TABLE_SIZE 16384
 #define ECMP_GROUP_TABLE_SIZE 1024
 #define IPV4_HOST_TABLE_SIZE 16384
@@ -86,7 +87,6 @@
 #include "forwarding.p4"
 #include "port.p4"
 #include "sr.p4"
-#include "rewrite.p4"
 
 header_type ingress_metadata_t {
   fields {
@@ -114,7 +114,6 @@ control ingress {
   // sr processing
   process_srv6();
 
-  // L3 forwarding
   apply(rmac) {
     rmac_hit {
       if (LOOKUP(L3)) {
@@ -125,7 +124,6 @@ control ingress {
 
   apply(nexthop);
 
-  // L2 forwarding
   if (LOOKUP(L2)) {
     process_l2_forwarding();
   }
@@ -144,7 +142,7 @@ control egress {
   // perform srv6 decap
   process_srv6_decap();
 
-  // apply packet rewrites based on nexthop index
+  // apply nexthop_index based packet rewrites
   process_rewrite();
 
   // perform tunnel encap

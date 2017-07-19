@@ -313,6 +313,7 @@ parser parse_inner_ipv6 {
     IP_PROTOCOLS_ICMPV6 : parse_icmp;
     IP_PROTOCOLS_TCP : parse_tcp;
     IP_PROTOCOLS_UDP : parse_udp;
+    IP_PROTOCOLS_SR : parse_inner_srh;
     default: ingress;
   }
 }
@@ -343,4 +344,35 @@ parser parse_inner_srh_seg_list {
     0x0 : ingress;
     default : parse_inner_srh_seg_list;
   }
+}
+
+//------------------------------------------------------------------------------
+// IPv4 checksum
+//------------------------------------------------------------------------------
+
+field_list ipv4_checksum_list {
+    ipv4.version;
+    ipv4.ihl;
+    ipv4.diffserv;
+    ipv4.totalLen;
+    ipv4.identification;
+    ipv4.flags;
+    ipv4.fragOffset;
+    ipv4.ttl;
+    ipv4.protocol;
+    ipv4.srcAddr;
+    ipv4.dstAddr;
+}
+
+field_list_calculation ipv4_checksum {
+    input {
+        ipv4_checksum_list;
+    }
+    algorithm : csum16;
+    output_width : 16;
+}
+
+calculated_field ipv4.hdrChecksum  {
+    verify ipv4_checksum;
+    update ipv4_checksum;
 }

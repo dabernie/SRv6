@@ -52,16 +52,9 @@ header_type l2_metadata_t {
   }
 }
 
-header_type tunnel_metadata_t {
-  fields {
-    index : 16;
-  }
-}
-
 @pragma pa_container_size ingress l3_metadata.ipv6_da 32
 metadata l3_metadata_t l3_metadata;
 metadata l2_metadata_t l2_metadata;
-metadata tunnel_metadata_t tunnel_metadata;
 
 //------------------------------------------------------------------------------
 //  Source MAC lookup
@@ -109,7 +102,7 @@ action dmac_hit(ifindex) {
 }
 
 action dmac_miss() {
-  // TODO
+  // TODO modify_field(ingress_metadata.egress_ifindex, IFINDEX_FLOOD);
 }
 
 action dmac_drop() {
@@ -206,7 +199,6 @@ table nexthop {
 action_profile l3_action_profile {
   actions {
     set_nexthop_info;
-    set_tunnel_info;
   }
   size : ECMP_SELECT_TABLE_SIZE;
   dynamic_action_selection: ecmp_selector;
@@ -221,14 +213,6 @@ action set_nexthop_info(bd, dmac) {
   modify_field(l2_metadata.bd, bd);
   modify_field(l2_metadata.mac_da, dmac);
   modify_field(ethernet.dstAddr, dmac);
-  modify_field(tunnel_metadata.index, 0);
-}
-
-action set_tunnel_info(bd, dmac, index) {
-  modify_field(l2_metadata.bd, bd);
-  modify_field(l2_metadata.mac_da, dmac);
-  modify_field(tunnel_metadata.index, index);
-  // modify_field(ethernet.dstAddr, dmac);
 }
 
 //------------------------------------------------------------------------------
@@ -348,6 +332,44 @@ table compute_hash {
 }
 
 //------------------------------------------------------------------------------
+// Egress L3 Rewrite
+//------------------------------------------------------------------------------
+table l3_rewrite {
+  reads {
+    ipv4 : valid;
+    ipv6 : valid;
+  }
+  actions {
+    ipv4_rewrite;
+    ipv6_rewrite;
+  }
+}
+
+action ipv4_rewrite() {
+  add_to_field(ipv4.ttl, -1);
+}
+
+action ipv6_rewrite() {
+  add_to_field(ipv6.hopLimit, -1);
+}
+
+//------------------------------------------------------------------------------
+// Egress L2 rewrite
+//------------------------------------------------------------------------------
+table l2_rewrite {
+  reads {
+    l2_metadata.bd : exact;
+  }
+  actions {
+    smac_rewrite;
+  }
+}
+
+action smac_rewrite(smac) {
+  modify_field(ethernet.srcAddr, smac);
+}
+
+//------------------------------------------------------------------------------
 // L2 Forwarding
 //------------------------------------------------------------------------------
 control process_l2_forwarding {
@@ -385,4 +407,10 @@ control process_l3_forwarding {
       process_ipv6_fib();
     }
   }
+}
+
+control process_rewrite {
+  apply(l2_rewrite);
+
+  apply(l3_rewrite);
 }

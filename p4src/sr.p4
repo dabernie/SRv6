@@ -42,7 +42,7 @@ metadata sr_metadata_t sr_metadata;
 // SR SID lookup
 //------------------------------------------------------------------------------
 // Based on SRv6 Network Programming
-// https://tools.ietf.org/html/draft-filsfils-spring-srv6-network-programming-00
+// https://tools.ietf.org/html/draft-filsfils-spring-srv6-network-programming-01
 table srv6_local_sid {
   reads {
     ipv6.dstAddr : lpm;
@@ -105,12 +105,14 @@ action end() {
   // Modify L3 fib lookup fields using active semgent SRH[SL]
   set_l3_fields(
     ipv6.srcAddr, sr_metadata.sid, ipv6.nextHdr, 0x6);
-  add_to_field(ipv6_srh.segLeft, -1);
-  modify_field(ipv6.dstAddr, sr_metadata.sid);
+  add_to_field(ipv6_srh.segLeft, -1);            /* decrement SL */
+  modify_field(ipv6.dstAddr, sr_metadata.sid);   /* update the IPv6 DA with SRH[SL] */
 }
 
 action end_usp() {
-    // TODO
+  modify_field(ig_intr_md_for_tm.ucast_egress_port, 0); //XXX(MILAD): Recirc port
+  modify_field(ingress_metadata.bypass, BYPASS_ALL);
+  modify_field(sr_metadata.action_, SRV6_SEGMENT_POP);
 }
 
 action end_psp() {
@@ -126,13 +128,16 @@ action end_x(nexthop) {
   // Endpoint with cross-connect to an array of layer-3 adjacencies.
   modify_field(l3_metadata.nexthop, nexthop);
   modify_field(ingress_metadata.bypass, BYPASS_L3);
-  add_to_field(ipv6_srh.segLeft, -1);
-  modify_field(ipv6.dstAddr, sr_metadata.sid);
+  add_to_field(ipv6_srh.segLeft, -1);            /* decrement SL */
+  modify_field(ipv6.dstAddr, sr_metadata.sid);   /* update the IPv6 DA with SRH[SL] */
 }
 
-action end_t() {
+action end_t(vrf) {
   set_l3_fields(
     ipv6.srcAddr, ipv6.dstAddr, ipv6.nextHdr, 0x6);
+  modify_field(l3_metadata.vrf, vrf);            /* table associated with the SID */
+  add_to_field(ipv6_srh.segLeft, -1);            /* decrement SL */
+  modify_field(ipv6.dstAddr, sr_metadata.sid);   /* update the IPv6 DA with SRH[SL] */
 }
 
 action end_dx2(ifindex) {
@@ -169,7 +174,7 @@ action end_dt4(vrf) {
 action end_dt6(vrf) {
   // Endpoint with decapsulation and specific IPv6 table lookup.
   modify_field(sr_metadata.action_, SRV6_TUNNEL_TERMINATE);
-  modify_field(l3_metadata.vrf, vrf);
+  modify_field(l3_metadata.vrf, vrf);            /* table associated with the SID */     
   // Other L3 lookup fields are set by parser
   modify_field(l3_metadata.proto, inner_ipv6.nextHdr);
   //modify_field(l3_metadata.flow_label, inner_ipv6.flowLabel);
@@ -177,18 +182,22 @@ action end_dt6(vrf) {
 
 action end_b6(sid) {
   // Endpoint bound to an SRv6 Policy.
+  // XXX : assume first segment of the new SRH is bound to END. Need
+  // a second lookup or flattened out lookup to support other functions.
   modify_field(sr_metadata.action_, SRV6_SRH_INSERT);
   // Modify L3 lookup field base on first segment of the SRv6 Policy
   set_l3_fields(ipv6.srcAddr, sid, ipv6.nextHdr, 0x6);
   modify_field(ipv6.dstAddr, sid);
 }
 
-action end_b6_encaps(sid, src_addr) {
+action end_b6_encaps(sid) {
   // Endpoint bound to an SRv6 encapsulation policy.
+  // XXX : assume first segment of the new SRH is bound to END. Need
+  // a second lookup or flattened out lookup to support other functions.
   modify_field(sr_metadata.action_, SRV6_TUNNEL_ENCAP);
-  set_l3_fields(src_addr, sid, ipv6.nextHdr, ipv6.flowLabel);
-  add_to_field(ipv6_srh.segLeft, -1);
-  modify_field(ipv6.dstAddr, sr_metadata.sid); // Set IPv6.DA to SRH[SL]
+  set_l3_fields(ipv6.srcAddr, sid, ipv6.nextHdr, 0x6);
+  add_to_field(ipv6_srh.segLeft, -1);            /* decrement SL */
+  modify_field(ipv6.dstAddr, sr_metadata.sid);   /* update the IPv6 DA with SRH[SL] */
 }
 
 //------------------------------------------------------------------------------
@@ -299,19 +308,28 @@ table srv6_encap_inner {
 
 table srv6_encap_outer {
   reads {
-    tunnel_metadata.index : exact;
+    sr_metadata.action_ : exact;
+    l3_metadata.nexthop : exact;
   }
   actions {
+    ip_srv6_rewrite_1; // SRH with 1 segment
+    ip_srv6_rewrite_2; // SRH with 2 segments
+    ip_srv6_rewrite_3; // SRH with 3 segments
+    // XXX not supported in 5.0.0 
+    // ip_srv6_rewrite_4; // SRH with 4 segments
+    // ip_srv6_rewrite_5; // SRH with 5 segments
     srv6_rewrite_1; // SRH with 1 segment
     srv6_rewrite_2; // SRH with 2 segments
     srv6_rewrite_3; // SRH with 3 segments
-    srv6_rewrite_4; // SRH with 4 segments
+    // XXX not supported in 5.0.0 
+    // srv6_rewrite_4; // SRH with 4 segments
+    // srv6_rewrite_5; // SRH with 5 segments
   }
 }
 
 table srv6_rewrite {
   reads {
-    tunnel_metadata.index : exact;
+    l3_metadata.nexthop : exact;
   }
   actions {
     set_tunnel_rewrite;
@@ -336,32 +354,48 @@ action inner_ipv6_srh_rewrite() {
     copy_header(inner_ipv6, ipv6);
     copy_srh_header();
     remove_header(ipv6);
+    remove_srh(); // Remove outer SRH
     add(sr_metadata.len, ipv6.payloadLen, 40);
     modify_field(sr_metadata.proto, IP_PROTOCOLS_IPV6);
 }
 
 action inner_srh_rewrite() {
-    copy_srh_header();
+    copy_srh_header(); // Copy outer SRH to inner SRH
+    remove_srh(); // Remove outer SRH
+    modify_field(sr_metadata.len, ipv6.payloadLen);
     modify_field(sr_metadata.proto, IP_PROTOCOLS_SR);
 }
 
 action inner_non_ip_rewrite() {
+  // copy_header(inner_ethernet, ethernet);
   add(sr_metadata.len, eg_intr_md.pkt_length, -14);
   modify_field(sr_metadata.proto, IP_PROTOCOLS_NONXT);
 }
 
-action srv6_rewrite_1(len, first_seg, seg_left, sid0) {
+action ip_srv6_rewrite_1(len, first_seg, seg_left, sid0) {
+  // Insert IPv6 header + SRH with 1 segment.
   modify_field(ethernet.etherType, ETHERTYPE_IPV6);
   insert_ipv6_header(IP_PROTOCOLS_SR);
+  srv6_rewrite_1(len, first_seg, seg_left, sid0);  
+}
+ 
+action srv6_rewrite_1(len, first_seg, seg_left, sid0) {
+  // Insert SRH with 1 segment.
   add(ipv6.payloadLen, sr_metadata.len, 24);
   insert_ipv6_srh(sr_metadata.proto, len, first_seg, seg_left);
   add_header(ipv6_srh_seg_list[0]);
   modify_field(ipv6_srh_seg_list[0].sid, sid0);
 }
 
-action srv6_rewrite_2(len, first_seg, seg_left, sid0, sid1) {
+action ip_srv6_rewrite_2(len, first_seg, seg_left, sid0, sid1) {
+  // Insert IPv6 header + SRH with 2 segments.
   modify_field(ethernet.etherType, ETHERTYPE_IPV6);
   insert_ipv6_header(IP_PROTOCOLS_SR);
+  srv6_rewrite_2(len, first_seg, seg_left, sid0, sid1);
+}
+
+action srv6_rewrite_2(len, first_seg, seg_left, sid0, sid1) {
+  // Insert SRH with 2 segments.
   add(ipv6.payloadLen, sr_metadata.len, 40);
   insert_ipv6_srh(sr_metadata.proto, len, first_seg, seg_left);
   add_header(ipv6_srh_seg_list[0]);
@@ -370,9 +404,15 @@ action srv6_rewrite_2(len, first_seg, seg_left, sid0, sid1) {
   modify_field(ipv6_srh_seg_list[1].sid, sid1);
 }
 
-action srv6_rewrite_3(len, first_seg, seg_left, sid0, sid1, sid2) {
+action ip_srv6_rewrite_3(len, first_seg, seg_left, sid0, sid1, sid2) {
+  // Insert IPv6 header + SRH with 3 segments.
   modify_field(ethernet.etherType, ETHERTYPE_IPV6);
   insert_ipv6_header(IP_PROTOCOLS_SR);
+  srv6_rewrite_3(len, first_seg, seg_left, sid0, sid1, sid2);
+}
+
+action srv6_rewrite_3(len, first_seg, seg_left, sid0, sid1, sid2) {
+  // Insert SRH with 3 segments.
   add(ipv6.payloadLen, sr_metadata.len, 56);
   insert_ipv6_srh(sr_metadata.proto, len, first_seg, seg_left);
   add_header(ipv6_srh_seg_list[0]);
@@ -384,8 +424,6 @@ action srv6_rewrite_3(len, first_seg, seg_left, sid0, sid1, sid2) {
 }
 
 action srv6_rewrite_4(len, first_seg, seg_left, sid0, sid1, sid2, sid3) {
-  modify_field(ethernet.etherType, ETHERTYPE_IPV6);
-  insert_ipv6_header(IP_PROTOCOLS_SR);
   add(ipv6.payloadLen, sr_metadata.len, 72);
   insert_ipv6_srh(sr_metadata.proto, len, first_seg, seg_left);
   add_header(ipv6_srh_seg_list[0]);
@@ -396,6 +434,21 @@ action srv6_rewrite_4(len, first_seg, seg_left, sid0, sid1, sid2, sid3) {
   modify_field(ipv6_srh_seg_list[1].sid, sid1);
   modify_field(ipv6_srh_seg_list[2].sid, sid2);
   modify_field(ipv6_srh_seg_list[3].sid, sid3);
+}
+
+action srv6_rewrite_5(len, first_seg, seg_left, sid0, sid1, sid2, sid3, sid4) {
+  add(ipv6.payloadLen, sr_metadata.len, 88);
+  insert_ipv6_srh(sr_metadata.proto, len, first_seg, seg_left);
+  add_header(ipv6_srh_seg_list[0]);
+  add_header(ipv6_srh_seg_list[1]);
+  add_header(ipv6_srh_seg_list[2]);
+  add_header(ipv6_srh_seg_list[3]);
+  add_header(ipv6_srh_seg_list[4]);
+  modify_field(ipv6_srh_seg_list[0].sid, sid0);
+  modify_field(ipv6_srh_seg_list[1].sid, sid1);
+  modify_field(ipv6_srh_seg_list[2].sid, sid2);
+  modify_field(ipv6_srh_seg_list[3].sid, sid3);
+  modify_field(ipv6_srh_seg_list[4].sid, sid4);
 }
 
 action set_tunnel_rewrite(smac, dmac, sip, dip) {
